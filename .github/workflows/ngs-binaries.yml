@@ -41,7 +41,7 @@ jobs:
 
       - name: Build generators
         run: |
-          cmake --workflow --preset generators --fresh -DSLANG_ENABLE_PCH=OFF
+          cmake --workflow --preset generators --fresh
           cmake --install build --config Release --component generators --prefix build-platform-generators
 
       - name: Setup target MSVC
@@ -95,3 +95,4 @@ jobs:
         with:
           name: slang-ngs-${{ matrix.rid }}
           path: dist
+          retention-days: 3
