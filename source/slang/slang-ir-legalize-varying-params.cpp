@@ -3009,68 +3009,70 @@ protected:
 
         auto indexAsString = String(workItem.attrIndex);
         SystemValueInfo info = getSystemValueInfo(semanticName, &indexAsString, var);
-        if (info.isSpecial)
-        {
-            handleSpecialSystemValue(entryPoint, workItem, info, builder);
-        }
-
         if (info.isUnsupported)
         {
             reportUnsupportedSystemAttribute(var, semanticName);
             return;
         }
-        if (!info.permittedTypes.getCount())
-            return;
-
-        builder.addTargetSystemValueDecoration(var, info.systemValueName.getUnownedSlice());
-
-        bool varTypeIsPermitted = false;
-        for (auto& permittedType : info.permittedTypes)
+        if (info.permittedTypes.getCount())
         {
-            varTypeIsPermitted = varTypeIsPermitted || permittedType == varType;
-        }
+            builder.addTargetSystemValueDecoration(var, info.systemValueName.getUnownedSlice());
 
-        if (!varTypeIsPermitted)
-        {
-            // Note: we do not currently prefer any conversion
-            // example:
-            // * allowed types for semantic: `float4`, `uint4`, `int4`
-            // * user used, `float2`
-            // * Slang will equally prefer `float4` to `uint4` to `int4`.
-            //   This means the type may lose data if slang selects `uint4` or `int4`.
-            bool foundAConversion = false;
-            for (auto permittedType : info.permittedTypes)
+            bool varTypeIsPermitted = false;
+            for (auto& permittedType : info.permittedTypes)
             {
-                var->setFullType(permittedType);
-                builder.setInsertBefore(
-                    entryPoint.entryPointFunc->getFirstBlock()->getFirstOrdinaryInst());
-
-                // get uses before we `tryConvertValue` since this creates a new use
-                List<IRUse*> uses;
-                for (auto use = var->firstUse; use; use = use->nextUse)
-                    uses.add(use);
-
-                auto convertedValue = tryConvertValue(builder, var, varType);
-                if (convertedValue == nullptr)
-                    continue;
-
-                foundAConversion = true;
-                copyNameHintAndDebugDecorations(convertedValue, var);
-
-                for (auto use : uses)
-                    builder.replaceOperand(use, convertedValue);
+                varTypeIsPermitted = varTypeIsPermitted || permittedType == varType;
             }
-            if (!foundAConversion)
+
+            if (!varTypeIsPermitted)
             {
-                // If we can't convert the value, report an error.
+                // Note: we do not currently prefer any conversion
+                // example:
+                // * allowed types for semantic: `float4`, `uint4`, `int4`
+                // * user used, `float2`
+                // * Slang will equally prefer `float4` to `uint4` to `int4`.
+                //   This means the type may lose data if slang selects `uint4` or `int4`.
+                bool foundAConversion = false;
                 for (auto permittedType : info.permittedTypes)
                 {
-                    m_sink->diagnose(Diagnostics::SystemValueTypeIncompatible{
-                        .semanticName = semanticName,
-                        .requiredType = permittedType,
-                        .location = var->sourceLoc});
+                    var->setFullType(permittedType);
+                    builder.setInsertBefore(
+                        entryPoint.entryPointFunc->getFirstBlock()->getFirstOrdinaryInst());
+
+                    // get uses before we `tryConvertValue` since this creates a new use
+                    List<IRUse*> uses;
+                    for (auto use = var->firstUse; use; use = use->nextUse)
+                        uses.add(use);
+
+                    auto convertedValue = tryConvertValue(builder, var, varType);
+                    if (convertedValue == nullptr)
+                        continue;
+
+                    foundAConversion = true;
+                    copyNameHintAndDebugDecorations(convertedValue, var);
+
+                    for (auto use : uses)
+                        builder.replaceOperand(use, convertedValue);
+                }
+                if (!foundAConversion)
+                {
+                    // If we can't convert the value, report an error.
+                    for (auto permittedType : info.permittedTypes)
+                    {
+                        m_sink->diagnose(Diagnostics::SystemValueTypeIncompatible{
+                            .semanticName = semanticName,
+                            .requiredType = permittedType,
+                            .location = var->sourceLoc});
+                    }
                 }
             }
+        }
+
+        // Derived values use native-width inputs. Conversions to the declared type must consume
+        // the derived value, rather than narrowing the operands of its computation.
+        if (info.isSpecial)
+        {
+            handleSpecialSystemValue(entryPoint, workItem, info, builder);
         }
     }
 
@@ -3332,18 +3334,21 @@ private:
                 auto flattenedStruct = maybeFlattenNestedStructs(
                     builder,
                     structType,
+                    layout,
                     mapOldFieldToNewField,
                     semanticInfoToRemove);
 
-                // Validate/rearange all semantics which overlap in our flat struct.
-                fixFieldSemanticsOfFlatStruct(flattenedStruct);
+                if (flattenedStruct == structType)
+                    fixFieldSemanticsOfFlatStruct(flattenedStruct);
                 ensureStructHasUserSemantic<LayoutResourceKind::VaryingInput>(
                     flattenedStruct,
                     layout);
                 if (flattenedStruct != structType)
                 {
-                    // Replace the 'old IRParam type' with a 'new IRParam type'
+                    // Replace the parameter type and its corresponding field layout together.
                     param->setFullType(flattenedStruct);
+                    param->findDecoration<IRLayoutDecoration>()->removeAndDeallocate();
+                    builder.addLayoutDecoration(param, layout);
 
                     // Emit a new variable at EntryPoint of 'old IRParam type'
                     builder.setInsertBefore(func->getFirstBlock()->getFirstOrdinaryInst());
@@ -3495,13 +3500,23 @@ private:
             .location = param->sourceLoc});
     }
 
+    // Look up a field's layout by its key, including after stage-interface fields are expanded.
+    static IRVarLayout* getStructFieldLayout(IRStructTypeLayout* typeLayout, IRStructKey* key)
+    {
+        for (auto fieldLayout : typeLayout->getFieldLayoutAttrs())
+        {
+            if (fieldLayout->getFieldKey() == key)
+                return fieldLayout->getLayout();
+        }
+        SLANG_UNEXPECTED("missing stage-interface field layout");
+    }
+
     template<LayoutResourceKind K>
     void ensureStructHasUserSemantic(IRStructType* structType, IRVarLayout* varLayout)
     {
         // Ensure each field in an output struct type has either a system semantic or a user
         // semantic, so that signature matching can happen correctly.
-        auto typeLayout = as<IRStructTypeLayout>(varLayout->getTypeLayout());
-        Index index = 0;
+        auto typeLayout = cast<IRStructTypeLayout>(varLayout->getTypeLayout());
         IRBuilder builder(structType);
         for (auto field : structType->getFields())
         {
@@ -3525,12 +3540,9 @@ private:
                         semanticDecor->removeAndDeallocate();
                     }
                 }
-                index++;
                 continue;
             }
-            SLANG_ASSERT(typeLayout);
-            typeLayout->getFieldLayout(index);
-            auto fieldLayout = typeLayout->getFieldLayout(index);
+            auto fieldLayout = getStructFieldLayout(typeLayout, key);
             if (auto offsetAttr = fieldLayout->findOffsetAttr(K))
             {
                 UInt varOffset = 0;
@@ -3539,7 +3551,6 @@ private:
                 varOffset += offsetAttr->getOffset();
                 builder.addSemanticDecoration(key, toSlice("_slang_attr"), (int)varOffset);
             }
-            index++;
         }
     }
 
@@ -3609,11 +3620,20 @@ private:
         static void _emitCopy(
             IRBuilder& builder,
             IRInst* val1,
-            IRStructType* type1,
             IRInst* val2,
-            IRStructType* type2,
             MapStructToFlatStruct& node)
         {
+            if constexpr (copyOptions == (int)CopyOptions::FlatStructIntoStruct)
+            {
+                if (as<IRPtrTypeBase>(val2->getDataType()))
+                    val2 = builder.emitLoad(val2);
+            }
+            else
+            {
+                if (as<IRPtrTypeBase>(val1->getDataType()))
+                    val1 = builder.emitLoad(val1);
+            }
+
             for (auto& field1Pair : node)
             {
                 auto& field1 = field1Pair.second;
@@ -3622,67 +3642,45 @@ private:
                 IRInst* fieldAddr1 = nullptr;
                 if constexpr (copyOptions == (int)CopyOptions::FlatStructIntoStruct)
                 {
-                    fieldAddr1 = builder.emitFieldAddress(type1, val1, field1.getKey());
+                    fieldAddr1 = builder.emitFieldAddress(val1, field1.getKey());
                 }
                 else
                 {
-                    if (as<IRPtrTypeBase>(val1))
-                        val1 = builder.emitLoad(val1);
-                    fieldAddr1 = builder.emitFieldExtract(type1, val1, field1.getKey());
+                    fieldAddr1 = builder.emitFieldExtract(val1, field1.getKey());
                 }
 
                 // If val1 is a struct, recurse
-                if (auto fieldAsStruct1 = as<IRStructType>(field1.getFieldType()))
+                if (as<IRStructType>(field1.getFieldType()))
                 {
-                    _emitCopy<copyOptions>(
-                        builder,
-                        fieldAddr1,
-                        fieldAsStruct1,
-                        val2,
-                        type2,
-                        field1);
+                    _emitCopy<copyOptions>(builder, fieldAddr1, val2, field1);
                     continue;
                 }
 
-                // A flattened array field maps to one new field per element; copy element-wise.
-                if (auto arrayType1 = as<IRArrayType>(field1.getFieldType()))
+                // Only expanded arrays have element mappings. Other arrays retain a whole-field
+                // mapping, just like scalar fields.
+                auto& elementMappings = field1.getElementMappings();
+                if (elementMappings.getCount())
                 {
-                    IRInst* flatVal = val2;
-                    if constexpr (copyOptions == (int)CopyOptions::FlatStructIntoStruct)
-                    {
-                        // val2 is the flat struct value; val1 is the old struct address.
-                        if (as<IRPtrTypeBase>(flatVal))
-                            flatVal = builder.emitLoad(flatVal);
-                    }
-                    auto& elementMappings = field1.getElementMappings();
+                    auto arrayType1 = cast<IRArrayType>(field1.getFieldType());
+                    SLANG_ASSERT(
+                        elementMappings.getCount() == getIntVal(arrayType1->getElementCount()));
                     for (Index elementIndex = 0; elementIndex < elementMappings.getCount();
                          elementIndex++)
                     {
                         auto elementField2 = elementMappings[elementIndex];
-                        if constexpr (copyOptions ==
-                                      (int)CopyOptions::FlatStructIntoStruct)
+                        auto index = builder.getIntValue(builder.getIntType(), elementIndex);
+                        if constexpr (copyOptions == (int)CopyOptions::FlatStructIntoStruct)
                         {
-                            auto elementAddr1 = builder.emitGetElementPtr(
-                                builder.getPtrType(arrayType1->getElementType()),
-                                fieldAddr1,
-                                elementIndex);
-                            auto elementVal2 = builder.emitFieldExtract(
-                                type2,
-                                flatVal,
-                                elementField2->getKey());
+                            auto elementAddr1 = builder.emitElementAddress(fieldAddr1, index);
+                            auto elementVal2 =
+                                builder.emitFieldExtract(val2, elementField2->getKey());
                             builder.emitStore(elementAddr1, elementVal2);
                         }
                         else
                         {
-                            // val1 holds the old struct value; val2 is the flat struct address.
-                            // The result type is stated explicitly: field extracts in this map
-                            // carry the struct type, not the field type.
-                            auto elementVal1 = builder.emitElementExtract(
-                                arrayType1->getElementType(),
-                                fieldAddr1,
-                                builder.getIntValue(builder.getIntType(), elementIndex));
+                            auto elementVal1 = builder.emitElementExtract(fieldAddr1, index);
                             auto elementAddr2 =
-                                builder.emitFieldAddress(type2, val2, elementField2->getKey());
+                                builder.emitFieldAddress(val2, elementField2->getKey());
                             builder.emitStore(elementAddr2, elementVal1);
                         }
                     }
@@ -3695,13 +3693,11 @@ private:
                 IRInst* fieldAddr2 = nullptr;
                 if constexpr (copyOptions == (int)CopyOptions::FlatStructIntoStruct)
                 {
-                    if (as<IRPtrTypeBase>(val2))
-                        val2 = builder.emitLoad(val1);
-                    fieldAddr2 = builder.emitFieldExtract(type2, val2, field2->getKey());
+                    fieldAddr2 = builder.emitFieldExtract(val2, field2->getKey());
                 }
                 else
                 {
-                    fieldAddr2 = builder.emitFieldAddress(type2, val2, field2->getKey());
+                    fieldAddr2 = builder.emitFieldAddress(val2, field2->getKey());
                 }
 
                 // Copy val2/val1 member into val1/val2 member
@@ -3751,25 +3747,13 @@ private:
                 // CopyOptions::FlatStructIntoStruct copy a flattened-struct (mapped member) into a
                 // struct
                 SLANG_ASSERT(node == dstStructType);
-                _emitCopy<copyOptions>(
-                    builder,
-                    dstVal,
-                    dstStructType,
-                    srcVal,
-                    srcStructType,
-                    *this);
+                _emitCopy<copyOptions>(builder, dstVal, srcVal, *this);
             }
             else
             {
                 // CopyOptions::StructIntoFlatStruct copy a struct into a flattened-struct
                 SLANG_ASSERT(node == srcStructType);
-                _emitCopy<copyOptions>(
-                    builder,
-                    srcVal,
-                    srcStructType,
-                    dstVal,
-                    dstStructType,
-                    *this);
+                _emitCopy<copyOptions>(builder, srcVal, dstVal, *this);
             }
         }
     };
@@ -3778,62 +3762,43 @@ private:
         IRBuilder& builder,
         IRStructType* dst,
         IRStructType* src,
+        IRStructTypeLayout* srcTypeLayout,
         IRSemanticDecoration* parentSemanticDecoration,
-        IRLayoutDecoration* parentLayout,
+        IRVarLayout* parentLayout,
         MapStructToFlatStruct& mapFieldToField,
         HashSet<IRStructField*>& varsWithSemanticInfo)
     {
-        // For all fields ('oldField') of a struct do the following:
-        // 1. Check for 'decorations which carry semantic info' (IRSemanticDecoration,
-        // IRLayoutDecoration), store these if found.
-        //  * Do not propagate semantic info if the current node has *any* form of semantic
-        //  information.
-        // Update varsWithSemanticInfo.
-        // 2. If IRStructType:
-        //  2a. Recurse this function with 'decorations that carry semantic info' from parent.
-        // 3. If not IRStructType:
-        //  3a Metal. Emit 'newField' equal to 'oldField', add 'decorations which carry semantic
-        //  info'.
-        //
-        //  3a WGSL. Emit 'newField' with 'newKey' equal to 'oldField' and 'oldKey', respectively,
-        //      where 'oldKey' is the key corresponding to 'oldField'.
-        //      Add 'decorations which carry semantic info' to 'newField', and move all decorations
-        //      of 'oldKey' to 'newKey'.
-        //  3b. Store a mapping from 'oldField' to 'newField' in 'mapFieldToField'. This info is
-        //  needed to copy between types.
+        // Expanded fields require layouts keyed by their new struct keys.
         for (auto oldField : src->getFields())
         {
             auto& fieldMappingNode = mapFieldToField[oldField];
             fieldMappingNode.setNode(oldField);
 
-            // step 1
-            bool foundSemanticDecor = false;
             auto oldKey = oldField->getKey();
-            IRSemanticDecoration* fieldSemanticDecoration = parentSemanticDecoration;
-            if (auto oldSemanticDecoration = oldKey->findDecoration<IRSemanticDecoration>())
-            {
-                foundSemanticDecor = true;
-                fieldSemanticDecoration = oldSemanticDecoration;
-                parentLayout = nullptr;
-            }
-
-            IRLayoutDecoration* fieldLayout = parentLayout;
-            if (auto oldLayout = oldKey->findDecoration<IRLayoutDecoration>())
-            {
-                fieldLayout = oldLayout;
-                if (!foundSemanticDecor)
-                    fieldSemanticDecoration = nullptr;
-            }
-            if (fieldSemanticDecoration != parentSemanticDecoration || parentLayout != fieldLayout)
+            auto fieldLayout = getStructFieldLayout(srcTypeLayout, oldKey);
+            auto fieldSemanticDecoration = oldKey->findDecoration<IRSemanticDecoration>();
+            auto fieldLayoutDecoration = oldKey->findDecoration<IRLayoutDecoration>();
+            if (fieldSemanticDecoration || fieldLayoutDecoration)
                 varsWithSemanticInfo.add(oldField);
+            // An explicit ancestor semantic overrides the sequential semantics in the type layout.
+            // For example, CoarseVertex6 on a struct still applies to its undecorated children.
+            if (!fieldSemanticDecoration && !fieldLayoutDecoration)
+                fieldSemanticDecoration = parentSemanticDecoration;
 
-            // step 2a
+            if (parentLayout)
+            {
+                if (parentLayout->findOffsetAttr(LayoutResourceKind::MetalAttribute))
+                    fieldLayout = handleGeometryStageParameterVarLayout(builder, fieldLayout);
+                fieldLayout = applyOffsetToVarLayout(&builder, fieldLayout, parentLayout);
+            }
+
             if (auto structFieldType = as<IRStructType>(oldField->getFieldType()))
             {
                 _flattenNestedStructs(
                     builder,
                     dst,
                     structFieldType,
+                    cast<IRStructTypeLayout>(fieldLayout->getTypeLayout()),
                     fieldSemanticDecoration,
                     fieldLayout,
                     fieldMappingNode,
@@ -3841,153 +3806,119 @@ private:
                 continue;
             }
 
-            // step 2b: an attribute can only decorate a scalar or vector stage field, so a
-            // user-semantic fixed-size array of a basic or vector type expands into one field
-            // per element, advancing the semantic index and each layout offset by one element.
-            // System-value arrays (e.g. SV_ClipDistance) keep their own separate handling.
-            bool systemValueSemantic = fieldSemanticDecoration != nullptr &&
-                fieldSemanticDecoration->getSemanticName().startsWithCaseInsensitive(
-                    toSlice("sv_"));
-            auto arrayFieldType = as<IRArrayType>(oldField->getFieldType());
-            if (!systemValueSemantic && arrayFieldType &&
-                as<IRIntLit>(arrayFieldType->getElementCount()) &&
-                (as<IRBasicType>(arrayFieldType->getElementType()) ||
-                 as<IRVectorType>(arrayFieldType->getElementType())))
+            // Materialize effective semantics before overlap legalization. Explicit keys and
+            // inherited explicit semantics take precedence over computed field-layout semantics.
+            UnownedStringSlice semanticName;
+            UInt semanticIndex = 0;
+            if (fieldSemanticDecoration)
             {
-                auto& arrayFieldMappingNode = mapFieldToField[oldField];
-                arrayFieldMappingNode.setNode(oldField);
+                semanticName = fieldSemanticDecoration->getSemanticName();
+                semanticIndex = fieldSemanticDecoration->getEffectiveSemanticIndex();
+            }
+            else if (auto systemSemantic = fieldLayout->findSystemValueSemanticAttr())
+            {
+                semanticName = systemSemantic->getName();
+                semanticIndex = systemSemantic->getIndex();
+            }
+            else if (auto userSemantic = fieldLayout->findAttr<IRUserSemanticAttr>())
+            {
+                semanticName = userSemantic->getName();
+                semanticIndex = userSemantic->getIndex();
+            }
+            // `TEXCOORD4` may be stored as ("TEXCOORD4", -1) on a key but ("TEXCOORD", 4)
+            // in a layout. Split the name before advancing array-element indices.
+            UnownedStringSlice indexInName;
+            if (splitNameAndIndex(semanticName, semanticName, indexInName))
+                semanticIndex = stringToInt(indexInName);
+
+            // Metal attributes decorate individual scalar/vector fields. System-value arrays
+            // and arrays of other element types retain their whole-field mapping.
+            if (isUserSemanticFlattenableArrayField(oldField, fieldLayout, fieldSemanticDecoration))
+            {
+                auto arrayFieldType = cast<IRArrayType>(oldField->getFieldType());
+                auto arrayTypeLayout = cast<IRArrayTypeLayout>(fieldLayout->getTypeLayout());
+                auto elementTypeLayout = arrayTypeLayout->getElementTypeLayout();
                 IRIntegerValue elementCount = getIntVal(arrayFieldType->getElementCount());
-                auto oldVarLayout =
-                    fieldLayout ? as<IRVarLayout>(fieldLayout->getLayout()) : nullptr;
-                auto arrayTypeLayout =
-                    oldVarLayout ? as<IRArrayTypeLayout>(oldVarLayout->getTypeLayout()) : nullptr;
                 auto elementNameHint = oldKey->findDecoration<IRNameHintDecoration>();
+
                 for (IRIntegerValue elementIndex = 0; elementIndex < elementCount; elementIndex++)
-                        {
-                            auto newKey = builder.createStructKey();
-                            if (elementNameHint)
-                            {
-                                StringBuilder elementName;
-                                elementName << elementNameHint->getName() << "_" << elementIndex;
-                                builder.addNameHintDecoration(
-                                    newKey,
-                                    elementName.getUnownedSlice());
-                            }
-                    if (fieldSemanticDecoration)
-                        builder.addSemanticDecoration(
-                            newKey,
-                            fieldSemanticDecoration->getSemanticName(),
-                            (int)(fieldSemanticDecoration->getEffectiveSemanticIndex() +
-                                  elementIndex));
-                    else if (oldVarLayout)
+                {
+                    auto newKey = builder.createStructKey();
+                    if (elementNameHint)
                     {
-                        // Keep the semantic on the key (not only in the layout) so downstream
-                        // semantic matching never indexes the old struct's type layout.
-                        if (auto userSemantic = oldVarLayout->findAttr<IRUserSemanticAttr>())
-                            builder.addSemanticDecoration(
-                                newKey,
-                                userSemantic->getName(),
-                                (int)(userSemantic->getIndex() + (UInt)elementIndex));
+                        StringBuilder elementName;
+                        elementName << elementNameHint->getName() << "_" << elementIndex;
+                        builder.addNameHintDecoration(newKey, elementName.getUnownedSlice());
                     }
-                    for (auto decor : oldKey->getDecorations())
-                        if (auto interpolationMode = as<IRInterpolationModeDecoration>(decor))
-                            builder.addInterpolationModeDecoration(
-                                newKey,
-                                interpolationMode->getMode());
-                    if (oldVarLayout)
+                    for (auto decoration : oldKey->getDecorations())
                     {
-                        List<IRInst*> layoutAttrs;
-                        for (auto attr : oldVarLayout->getAllAttrs())
-                        {
-                            if (auto userSemantic = as<IRUserSemanticAttr>(attr))
-                            {
-                                layoutAttrs.add(builder.getUserSemanticAttr(
-                                    userSemantic->getName(),
-                                    userSemantic->getIndex() + (UInt)elementIndex));
-                            }
-                            else if (auto offset = as<IRVarOffsetAttr>(attr))
-                            {
-                                auto kind = offset->getResourceKind();
-                                // A geometry-stage field's offsets were translated to
-                                // MetalAttribute, whose per-element stride the pre-translation
-                                // VaryingInput layout carries.
-                                auto sizeKind = kind == LayoutResourceKind::MetalAttribute
-                                                    ? LayoutResourceKind::VaryingInput
-                                                    : kind;
-                                UInt elementStride = 1;
-                                if (arrayTypeLayout && arrayTypeLayout->getElementTypeLayout())
-                                {
-                                    if (auto sizeAttr = arrayTypeLayout->getElementTypeLayout()
-                                                            ->findSizeAttr(sizeKind))
-                                    {
-                                        if (sizeAttr->getFiniteSize() != 0)
-                                            elementStride = sizeAttr->getFiniteSize();
-                                    }
-                                }
-                                layoutAttrs.add(builder.getVarOffsetAttr(
-                                    kind,
-                                    offset->getOffset() + (UInt)elementIndex * elementStride,
-                                    offset->getSpace()));
-                            }
-                            else if (as<IRSystemValueSemanticAttr>(attr) || as<IRStageAttr>(attr))
-                            {
-                                layoutAttrs.add(attr);
-                            }
-                        }
-                        builder.addLayoutDecoration(newKey, builder.getVarLayout(layoutAttrs));
+                        if (as<IRInterpolationModeDecoration>(decoration))
+                            cloneDecoration(decoration, newKey);
                     }
-                    arrayFieldMappingNode.addElementMapping(
-                        builder.createStructField(dst, newKey, arrayFieldType->getElementType()));
+                    IRVarLayout::Builder elementLayoutBuilder(&builder, elementTypeLayout);
+                    elementLayoutBuilder.cloneEverythingButOffsetsFrom(fieldLayout);
+                    if (semanticName.getLength())
+                    {
+                        auto index = semanticIndex + (UInt)elementIndex;
+                        builder.addSemanticDecoration(newKey, semanticName, (int)index);
+                        elementLayoutBuilder.setUserSemantic(String(semanticName), index);
+                    }
+                    for (auto offset : fieldLayout->getOffsetAttrs())
+                    {
+                        auto kind = offset->getResourceKind();
+                        // Geometric-stage inputs translate offsets, but not type sizes, to
+                        // MetalAttribute.
+                        auto sizeKind = kind == LayoutResourceKind::MetalAttribute
+                                            ? LayoutResourceKind::VaryingInput
+                                            : kind;
+                        auto sizeAttr = elementTypeLayout->findSizeAttr(sizeKind);
+                        UInt elementStride = sizeAttr ? sizeAttr->getFiniteSize() : 0;
+                        auto resInfo = elementLayoutBuilder.findOrAddResourceInfo(kind);
+                        resInfo->offset = offset->getOffset() + (UInt)elementIndex * elementStride;
+                        resInfo->space = offset->getSpace();
+                    }
+                    auto elementLayout = elementLayoutBuilder.build();
+                    builder.addLayoutDecoration(newKey, elementLayout);
+                    auto newField =
+                        builder.createStructField(dst, newKey, arrayFieldType->getElementType());
+                    copyNameHintAndDebugDecorations(newField, oldField);
+                    fieldMappingNode.addElementMapping(newField);
                 }
                 continue;
             }
 
-            // step 3a
             auto newKey = builder.createStructKey();
             flattenNestedStructsTransferKeyDecorations(newKey, oldKey);
+            while (auto semanticDecoration = newKey->findDecoration<IRSemanticDecoration>())
+                semanticDecoration->removeAndDeallocate();
+            while (auto layoutDecoration = newKey->findDecoration<IRLayoutDecoration>())
+                layoutDecoration->removeAndDeallocate();
 
             auto newField = builder.createStructField(dst, newKey, oldField->getFieldType());
             copyNameHintAndDebugDecorations(newField, oldField);
 
-            if (fieldSemanticDecoration)
-                builder.addSemanticDecoration(
-                    newKey,
-                    fieldSemanticDecoration->getSemanticName(),
-                    fieldSemanticDecoration->getSemanticIndex());
+            if (semanticName.getLength())
+                builder.addSemanticDecoration(newKey, semanticName, (int)semanticIndex);
 
-            if (fieldLayout)
-            {
-                IRLayout* oldLayout = fieldLayout->getLayout();
-                List<IRInst*> instToCopy;
-                // Only copy certain decorations needed for resolving system semantics
-                for (UInt i = 0; i < oldLayout->getOperandCount(); i++)
-                {
-                    auto operand = oldLayout->getOperand(i);
-                    if (as<IRVarOffsetAttr>(operand) || as<IRUserSemanticAttr>(operand) ||
-                        as<IRSystemValueSemanticAttr>(operand) || as<IRStageAttr>(operand))
-                        instToCopy.add(operand);
-                }
-                IRVarLayout* newLayout = builder.getVarLayout(instToCopy);
-                builder.addLayoutDecoration(newKey, newLayout);
-            }
-            // step 3b
+            builder.addLayoutDecoration(newKey, fieldLayout);
             fieldMappingNode.setMapping(newField);
         }
 
         return dst;
     }
 
-    // Returns true if `field` is a fixed-size array of a basic/vector type carrying its own
-    // user (non-system-value) semantic, so stage-interface flattening must expand it into one
-    // field per element.
-    static bool isUserSemanticFlattenableArrayField(IRStructField* field)
+    // Returns whether this stage-interface field needs one scalar/vector field per element.
+    // System semantics may live on either the key or its layout and must not be expanded here.
+    static bool isUserSemanticFlattenableArrayField(
+        IRStructField* field,
+        IRVarLayout* fieldLayout,
+        IRSemanticDecoration* semanticDecoration)
     {
-        auto key = field->getKey();
-        auto semanticDecoration = key->findDecoration<IRSemanticDecoration>();
-        if (!semanticDecoration && !key->findDecoration<IRLayoutDecoration>())
+        if (fieldLayout->findSystemValueSemanticAttr() ||
+            field->getKey()->findDecoration<IRTargetSystemValueDecoration>())
             return false;
-        if (semanticDecoration && semanticDecoration->getSemanticName().startsWithCaseInsensitive(
-                                       toSlice("sv_")))
+        if (semanticDecoration &&
+            semanticDecoration->getSemanticName().startsWithCaseInsensitive(toSlice("sv_")))
             return false;
         auto arrayType = as<IRArrayType>(field->getFieldType());
         return arrayType && as<IRIntLit>(arrayType->getElementCount()) &&
@@ -4002,15 +3933,20 @@ private:
     IRStructType* maybeFlattenNestedStructs(
         IRBuilder& builder,
         IRStructType* src,
+        IRVarLayout*& varLayout,
         MapStructToFlatStruct& mapFieldToField,
         HashSet<IRStructField*>& varsWithSemanticInfo)
     {
+        auto srcTypeLayout = cast<IRStructTypeLayout>(varLayout->getTypeLayout());
         // Find all values inside struct that need flattening and legalization.
         bool hasFlattenableMembers = false;
         for (auto field : src->getFields())
         {
             if (as<IRStructType>(field->getFieldType()) ||
-                isUserSemanticFlattenableArrayField(field))
+                isUserSemanticFlattenableArrayField(
+                    field,
+                    getStructFieldLayout(srcTypeLayout, field->getKey()),
+                    field->getKey()->findDecoration<IRSemanticDecoration>()))
             {
                 hasFlattenableMembers = true;
                 break;
@@ -4019,24 +3955,61 @@ private:
         if (!hasFlattenableMembers)
             return src;
 
-        // We need to:
-        // 1. Make new struct 1:1 with old struct but without nestested structs (flatten)
-        // 2. Ensure semantic attributes propegate. This will create overlapping semantics (can be
-        // handled later).
-        // 3. Store the mapping from old to new struct fields to allow copying a old-struct to
-        // new-struct.
         builder.setInsertAfter(src);
         auto newStruct = builder.createStructType();
         copyNameHintAndDebugDecorations(newStruct, src);
         mapFieldToField.setNode(src);
-        return _flattenNestedStructs(
+        _flattenNestedStructs(
             builder,
             newStruct,
             src,
+            srcTypeLayout,
             nullptr,
             nullptr,
             mapFieldToField,
             varsWithSemanticInfo);
+        fixFieldSemanticsOfFlatStruct(newStruct);
+
+        // Publish the typed layout after semantic normalization, so key decorations and field
+        // layouts agree even when an inherited semantic was relocated to avoid a collision.
+        IRStructTypeLayout::Builder layoutBuilder(&builder);
+        layoutBuilder.addResourceUsageFrom(srcTypeLayout);
+        for (auto field : newStruct->getFields())
+        {
+            auto key = field->getKey();
+            auto layoutDecoration = key->findDecoration<IRLayoutDecoration>();
+            auto fieldLayout = cast<IRVarLayout>(layoutDecoration->getLayout());
+            if (auto semanticDecoration = key->findDecoration<IRSemanticDecoration>())
+            {
+                List<IRInst*> layoutOperands;
+                for (UInt i = 0; i < fieldLayout->getOperandCount(); i++)
+                {
+                    auto operand = fieldLayout->getOperand(i);
+                    if (!as<IRSemanticAttr>(operand))
+                        layoutOperands.add(operand);
+                }
+                auto name = semanticDecoration->getSemanticName();
+                auto index = UInt(semanticDecoration->getEffectiveSemanticIndex());
+                if (name.startsWithCaseInsensitive(toSlice("sv_")))
+                    layoutOperands.add(builder.getSystemValueSemanticAttr(name, index));
+                else
+                    layoutOperands.add(builder.getUserSemanticAttr(name, index));
+                fieldLayout = builder.getVarLayout(layoutOperands);
+                layoutDecoration->removeAndDeallocate();
+                builder.addLayoutDecoration(key, fieldLayout);
+            }
+            layoutBuilder.addField(key, fieldLayout);
+        }
+        IRVarLayout::Builder varLayoutBuilder(&builder, layoutBuilder.build());
+        varLayoutBuilder.cloneEverythingButOffsetsFrom(varLayout);
+        for (auto offset : varLayout->getOffsetAttrs())
+        {
+            auto resInfo = varLayoutBuilder.findOrAddResourceInfo(offset->getResourceKind());
+            resInfo->offset = offset->getOffset();
+            resInfo->space = offset->getSpace();
+        }
+        varLayout = varLayoutBuilder.build();
+        return newStruct;
     }
 
     // Replaces all 'IRReturn' by copying the current 'IRReturn' to a new var of type 'newType'.
@@ -4373,10 +4346,15 @@ private:
             auto flattenedStruct = maybeFlattenNestedStructs(
                 builder,
                 returnStructType,
+                resultLayout,
                 mapOldFieldToNewField,
                 semanticInfoToRemove);
             if (returnStructType != flattenedStruct)
             {
+                builder.addLayoutDecoration(
+                    func,
+                    builder.getEntryPointLayout(entryPointLayout->getParamsLayout(), resultLayout));
+                entryPointLayoutDecor->removeAndDeallocate();
                 // Replace all return-values with the flattenedStruct we made.
                 _replaceAllReturnInst(
                     builder,
@@ -4396,8 +4374,8 @@ private:
                     });
                 fixUpFuncType(func, flattenedStruct);
             }
-            // Ensure non-overlapping semantics
-            fixFieldSemanticsOfFlatStruct(flattenedStruct);
+            if (flattenedStruct == returnStructType)
+                fixFieldSemanticsOfFlatStruct(flattenedStruct);
             ensureStructHasUserSemantic<LayoutResourceKind::VaryingOutput>(
                 flattenedStruct,
                 resultLayout);
@@ -4484,20 +4462,20 @@ private:
         List<SystemValLegalizationWorkItem> systemValWorkItems =
             collectSystemValFromEntryPoint(entryPoint);
 
-        // We legalize SV_GroupIndex after all other system values. Metal computes it from the
-        // entry point's SV_GroupThreadID parameter, and legalizing that parameter afterwards
-        // would narrow it to the declared type (e.g. `uint`) and redirect every use, including
-        // the group index computation, to the narrowed value.
-        for (bool isGroupIndexPass : {false, true})
+        // Derived system values must reference native-width inputs, not conversions to
+        // user-declared types.
+        for (bool isDerivedValuePass : {false, true})
         {
             for (auto& workItem : systemValWorkItems)
             {
                 UnownedStringSlice semanticName;
                 UnownedStringSlice semanticIndex;
                 splitNameAndIndex(workItem.attrName.getUnownedSlice(), semanticName, semanticIndex);
-                bool isGroupIndex = convertSystemValueSemanticNameToEnum(String(semanticName)) ==
-                                    SystemValueSemanticName::GroupIndex;
-                if (isGroupIndex == isGroupIndexPass)
+                auto systemValue = convertSystemValueSemanticNameToEnum(String(semanticName));
+                bool isDerivedValue = systemValue == SystemValueSemanticName::GroupIndex ||
+                                      systemValue == SystemValueSemanticName::VertexID ||
+                                      systemValue == SystemValueSemanticName::InstanceID;
+                if (isDerivedValue == isDerivedValuePass)
                     legalizeSystemValue(entryPoint, workItem);
             }
         }
@@ -4657,10 +4635,9 @@ protected:
             }
         case SystemValueSemanticName::InstanceID:
             {
-                // [[instance_id]] includes the base instance; SV_InstanceID does not. Unlike the
-                // other special values, the normal path still runs after the special handler:
-                // it decorates and converts the parameter, and the handler only adds the
-                // subtraction.
+                // [[instance_id]] includes the base instance; SV_InstanceID does not. Normal
+                // type legalization establishes the native-width parameter before the special
+                // handler adds the subtraction.
                 result.isSpecial = true;
                 result.systemValueName = toSlice("instance_id");
                 result.permittedTypes.add(builder.getBasicType(BaseType::UInt));
@@ -4848,6 +4825,11 @@ protected:
         SLANG_OVERRIDE
     {
         copyNameHintAndDebugDecorations(newKey, oldKey);
+        for (auto decoration : oldKey->getDecorations())
+        {
+            if (as<IRInterpolationModeDecoration>(decoration))
+                cloneDecoration(decoration, newKey);
+        }
     }
 
     UnownedStringSlice getUserSemanticNameSlice(String& loweredName, bool isUserSemantic) const
@@ -4945,14 +4927,9 @@ protected:
                 svBuilder.addTargetSystemValueDecoration(baseInstance, toSlice("base_instance"));
                 svBuilder.addNameHintDecoration(baseInstance, toSlice("base_instance"));
             }
-            if (baseInstance->getFullType() != var->getFullType())
-            {
-                // The front end only admits scalar integers for SV_InstanceID, so this converts.
-                baseInstance = tryConvertValue(svBuilder, baseInstance, var->getFullType());
-                SLANG_ASSERT(baseInstance);
-            }
-            // The normal path still legalizes `var` (and a reused base declared after it) and
-            // redirects their uses here to the converted values.
+            // Both parameters already have their native types; the declared-type conversion
+            // of SV_InstanceID, if any, is among the uses redirected to the difference.
+            SLANG_ASSERT(baseInstance->getFullType() == var->getFullType());
             auto baseRelativeInstanceId = svBuilder.emitSub(var->getFullType(), var, baseInstance);
             for (auto use : uses)
                 svBuilder.replaceOperand(use, baseRelativeInstanceId);
@@ -4981,14 +4958,9 @@ protected:
                 svBuilder.addTargetSystemValueDecoration(baseVertex, toSlice("base_vertex"));
                 svBuilder.addNameHintDecoration(baseVertex, toSlice("base_vertex"));
             }
-            if (baseVertex->getFullType() != var->getFullType())
-            {
-                // The front end only admits scalar integers for SV_VertexID, so this converts.
-                baseVertex = tryConvertValue(svBuilder, baseVertex, var->getFullType());
-                SLANG_ASSERT(baseVertex);
-            }
-            // The normal path still legalizes `var` (and a reused base declared after it) and
-            // redirects their uses here to the converted values.
+            // Both parameters already have their native types; the declared-type conversion
+            // of SV_VertexID, if any, is among the uses redirected to the difference.
+            SLANG_ASSERT(baseVertex->getFullType() == var->getFullType());
             auto baseRelativeVertexId = svBuilder.emitSub(var->getFullType(), var, baseVertex);
             for (auto use : uses)
                 svBuilder.replaceOperand(use, baseRelativeVertexId);
@@ -5753,11 +5725,45 @@ void legalizeShaderOutputParamsForMetal(
     if (!triggerOnStructReturn && !hasOutParameters)
         return;
 
+    auto entryPointLayout =
+        cast<IREntryPointLayout>(oldFunc->findDecoration<IRLayoutDecoration>()->getLayout());
+    List<IRVarLayout*> resultFieldLayouts;
+    if (!as<IRVoidType>(returnType))
+        resultFieldLayouts.add(entryPointLayout->getResultLayout());
+    for (auto param : oldFunc->getParams())
+    {
+        if (as<IROutParamTypeBase>(param->getDataType()))
+            resultFieldLayouts.add(findVarLayout(param));
+    }
+
     const bool alwaysUseReturnStruct = true;
     entryPoint.entryPointFunc = lowerOutParameters(oldFunc, sink, alwaysUseReturnStruct);
 
     if (oldFunc == entryPoint.entryPointFunc)
         return;
+
+    // The result wrapper and its layout must have the same fields, including the original return
+    // value and each lowered output parameter.
+    IRBuilder builder(entryPoint.entryPointFunc);
+    IRStructTypeLayout::Builder resultTypeLayoutBuilder(&builder);
+    Index fieldIndex = 0;
+    for (auto field : cast<IRStructType>(entryPoint.entryPointFunc->getResultType())->getFields())
+    {
+        auto fieldLayout = resultFieldLayouts[fieldIndex++];
+        builder.addLayoutDecoration(field->getKey(), fieldLayout);
+        resultTypeLayoutBuilder.addField(field->getKey(), fieldLayout);
+        resultTypeLayoutBuilder.addResourceUsageFrom(fieldLayout->getTypeLayout());
+    }
+    SLANG_ASSERT(fieldIndex == resultFieldLayouts.getCount());
+    IRVarLayout::Builder resultLayoutBuilder(&builder, resultTypeLayoutBuilder.build());
+    resultLayoutBuilder.setStage(stage);
+    auto layoutDecor = entryPoint.entryPointFunc->findDecoration<IRLayoutDecoration>();
+    builder.addLayoutDecoration(
+        entryPoint.entryPointFunc,
+        builder.getEntryPointLayout(
+            entryPointLayout->getParamsLayout(),
+            resultLayoutBuilder.build()));
+    layoutDecor->removeAndDeallocate();
 
     // The wrapper is now the entry point, so global uniform params that recorded `oldFunc` as
     // their originating entry point must follow it (see retargetEntryPointParamDecorations).

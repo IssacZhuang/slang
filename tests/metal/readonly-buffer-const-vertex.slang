@@ -15,7 +15,7 @@ struct VSOutput
     float4 position : SV_Position;
 };
 
-// CHECK: {{\[\[}}vertex{{\]\]}} {{.*}} main{{.*}}(uint {{.*}} {{\[\[}}vertex_id{{\]\]}}, const float device* scales_{{[0-9]+}} {{\[\[}}buffer(0){{\]\]}}, const uint32_t device* raw_{{[0-9]+}} {{\[\[}}buffer(1){{\]\]}})
+// CHECK: {{\[\[}}vertex{{\]\]}} {{.*}} main{{.*}}(uint {{.*}} {{\[\[}}vertex_id{{\]\]}}, uint {{.*}} {{\[\[}}base_vertex{{\]\]}}, const float device* scales_{{[0-9]+}} {{\[\[}}buffer(0){{\]\]}}, const uint32_t device* raw_{{[0-9]+}} {{\[\[}}buffer(1){{\]\]}})
 [shader("vertex")]
 VSOutput main(uint vid: SV_VertexID)
 {

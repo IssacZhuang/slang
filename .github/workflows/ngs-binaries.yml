@@ -11,7 +11,81 @@ on:
     branches: [master]
 
 jobs:
+  regressions:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Build compiler tests
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DSLANG_ENABLE_PCH=OFF \
+            -DSLANG_SLANG_LLVM_FLAVOR=FETCH_BINARY \
+            -DSLANG_DXC_BUILD_FROM_SOURCE=OFF \
+            -DSLANG_ENABLE_EXAMPLES=OFF \
+            -DSLANG_ENABLE_TESTS=ON \
+            -DSLANG_ENABLE_SLANG_RHI=ON
+          cmake --build build --target slangc slang-test --parallel 4
+
+      - name: Run Metal regressions
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/build/Release/lib
+        run: |
+          build/Release/bin/slang-test -api none -skip-api-detection \
+            -use-shared-library -disable-retries \
+            tests/metal/ngs- \
+            tests/metal/sv-instance-id.slang.0 \
+            tests/metal/sv-instance-id.slang.1 \
+            tests/metal/sv-instance-id.slang.2 \
+            tests/metal/sv-instance-id.slang.3 \
+            tests/metal/sv-instance-id.slang.4 \
+            tests/metal/sv-instance-id.slang.5 \
+            tests/metal/group-index-narrow-group-thread-id.slang.0 \
+            tests/metal/group-index-narrow-group-thread-id.slang.1 \
+            tests/metal/group-index-narrow-group-thread-id.slang.2 \
+            tests/metal/group-index-narrow-group-thread-id.slang.3 \
+            tests/metal/vector-storage-packed-layout.slang \
+            tests/metal/cbuffer-vector-native-layout.slang \
+            tests/metal/metal-pointer-bitcast.slang \
+            tests/metal/matrix-storage-packed-layout.slang.0 \
+            tests/metal/matrix-storage-packed-layout.slang.1 \
+            tests/metal/matrix-storage-packed-layout.slang.2 \
+            tests/metal/vector-argument-buffer-layout.slang.0 \
+            tests/metal/cbuffer-pointer-levels.slang.0 \
+            tests/metal/pointer-in-buffer-compute-roundtrip.slang.0 | tee build/ngs-tests.log
+          python3 - <<'PY'
+          import pathlib
+          import re
+
+          output = pathlib.Path("build/ngs-tests.log").read_text()
+          summary = re.search(r"^([0-9]+)% of tests passed \(([0-9]+)/([0-9]+)\)(?:, ([0-9]+) tests ignored)?$", output, re.MULTILINE)
+          if (summary is None or int(summary[1]) != 100 or int(summary[2]) != 64
+                  or summary[2] != summary[3] or int(summary[4] or 0) != 0):
+              raise SystemExit("All 64 Metal regression tests must execute and pass.")
+          PY
+
+      - name: Run Metal and WGSL source suites
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/build/Release/lib
+        run: |
+          build/Release/bin/slang-test -api none -skip-api-detection \
+            -use-shared-library -disable-retries tests/metal/ tests/wgsl/ | tee build/source-tests.log
+          python3 - <<'PY'
+          import pathlib
+          import re
+
+          output = pathlib.Path("build/source-tests.log").read_text()
+          summary = re.search(r"^([0-9]+)% of tests passed \(([0-9]+)/([0-9]+)\)(?:, ([0-9]+) tests ignored)?$", output, re.MULTILINE)
+          if (summary is None or int(summary[1]) != 100 or int(summary[2]) < 64
+                  or summary[2] != summary[3]):
+              raise SystemExit("All available Metal and WGSL source tests must pass.")
+          PY
+
   build:
+    needs: regressions
     name: ${{ matrix.rid }}
     strategy:
       fail-fast: false
@@ -32,6 +106,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           submodules: recursive
 
       # The Mac mini's cmake/ninja are pip installs living outside the runner's
@@ -98,6 +173,55 @@ jobs:
             osx-*) cp -L build/Release/lib/libslang-compiler.dylib "dist/${{ matrix.rid }}/libslang.dylib" ;;
           esac
           ls -la "dist/${{ matrix.rid }}"
+
+      - name: Verify staged runtime
+        env:
+          RID: ${{ matrix.rid }}
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then python=python; else python=python3; fi
+          "$python" - <<'PY'
+          import ctypes
+          import os
+          import pathlib
+          import platform
+          import struct
+
+          rid = os.environ["RID"]
+          target_os, target_arch = rid.split("-")
+          native = pathlib.Path("dist") / rid
+          expected_machine = {
+              ("win", "x64"): 0x8664, ("win", "arm64"): 0xAA64,
+              ("linux", "x64"): 62, ("linux", "arm64"): 183,
+              ("osx", "x64"): 0x01000007, ("osx", "arm64"): 0x0100000C,
+          }[(target_os, target_arch)]
+          for path in native.iterdir():
+              data = path.read_bytes()
+              if target_os == "win":
+                  pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+                  machine = struct.unpack_from("<H", data, pe_offset + 4)[0]
+              elif target_os == "linux":
+                  machine = struct.unpack_from("<H", data, 18)[0]
+              else:
+                  machine = struct.unpack_from("<I", data, 4)[0]
+              if machine != expected_machine:
+                  raise SystemExit(f"Incorrect architecture: {path}: {machine:#x}")
+          core_name = {"win": "slang-compiler.dll", "linux": "libslang.so", "osx": "libslang.dylib"}[target_os]
+          commit = os.environ["GITHUB_SHA"][:7]
+          if ("-g" + commit).encode() not in (native / core_name).read_bytes():
+              raise SystemExit("Compiler build tag does not identify this source commit.")
+          host_arch = {"AMD64": "x64", "x86_64": "x64", "arm64": "arm64", "aarch64": "arm64"}[platform.machine()]
+          if host_arch == target_arch:
+              if target_os == "win":
+                  directory = os.add_dll_directory(str(native.resolve()))
+              library = ctypes.CDLL(str((native / ("slang.dll" if target_os == "win" else core_name)).resolve()))
+              library.spGetBuildTagString.restype = ctypes.c_char_p
+              tag = library.spGetBuildTagString().decode()
+              if "-g" + commit not in tag:
+                  raise SystemExit(f"Unexpected loaded compiler build tag: {tag}")
+              print(f"{rid}: loaded {tag}")
+          else:
+              print(f"{rid}: verified cross-compiled architecture and source identity")
+          PY
 
       - uses: actions/upload-artifact@v4
         with:

@@ -26,7 +26,7 @@ float4 vertUint(uint i : SV_InstanceID) : SV_Position
 
 // HLSL-DAG: instance_id]]
 // HLSL-DAG: base_instance]]
-// HLSL: int(i{{[0-9_]*}}) - int(base_instance{{[0-9_]*}})
+// HLSL: int(i{{[0-9_]*}} - base_instance{{[0-9_]*}})
 [shader("vertex")]
 float4 vertMain(int i : SV_InstanceID) : SV_Position
 {
@@ -50,20 +50,18 @@ float4 vertBoth(uint i : SV_InstanceID, uint base : SV_StartInstanceLocation) : 
     return i + base;
 }
 
-// The reused parameter is converted to the declared type of SV_InstanceID.
+// The native difference is converted to the declared type of SV_InstanceID.
 // MIXED: vertMixed(uint {{[^,]*}}instance_id]], uint {{[^,]*}}base_instance]])
-// MIXED: int [[BASE:[A-Za-z_0-9]+]] = int(base{{[0-9_]*}});
-// MIXED: int(i{{[0-9_]*}}) - [[BASE]] + [[BASE]]
+// MIXED: int(i{{[0-9_]*}} - base{{[0-9_]*}}) + int(base{{[0-9_]*}})
 [shader("vertex")]
 float4 vertMixed(int i : SV_InstanceID, uint base : SV_StartInstanceLocation) : SV_Position
 {
     return i + int(base);
 }
 
-// A reused parameter legalized after SV_InstanceID is converted ahead of the subtraction.
+// A reused base declared after SV_InstanceID keeps its independent signed conversion.
 // BOTHINT: vertBothInt(uint {{[^,]*}}instance_id]], uint {{[^,]*}}base_instance]])
-// BOTHINT: int [[BASE:[A-Za-z_0-9]+]] = int(base{{[0-9_]*}});
-// BOTHINT: int(i{{[0-9_]*}}) - [[BASE]] + [[BASE]]
+// BOTHINT: int(i{{[0-9_]*}} - base{{[0-9_]*}}) + int(base{{[0-9_]*}})
 [shader("vertex")]
 float4 vertBothInt(int i : SV_InstanceID, int base : SV_StartInstanceLocation) : SV_Position
 {
