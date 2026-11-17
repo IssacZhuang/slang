@@ -234,9 +234,9 @@ jobs:
 
           # Advanced configuration (override action defaults via repository variables)
           model: ${{ vars.ANTHROPIC_MODEL }}
-          nv-inference-opus-model: ${{ vars.CLAUDE_NV_OPUS_MODEL }}
-          nv-inference-sonnet-model: ${{ vars.CLAUDE_NV_SONNET_MODEL }}
-          nv-inference-haiku-model: ${{ vars.CLAUDE_NV_HAIKU_MODEL }}
+          nv-inference-opus-model: nvidia/zai-org/glm-5.3
+          nv-inference-sonnet-model: nvidia/zai-org/glm-5.3
+          nv-inference-haiku-model: nvidia/zai-org/glm-5.3-flash
           aws-region: ${{ vars.AWS_REGION }}
           bedrock-base-url: ${{ vars.ANTHROPIC_BEDROCK_BASE_URL }}
           small-fast-model: ${{ vars.ANTHROPIC_SMALL_FAST_MODEL }}
