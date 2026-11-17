@@ -1756,7 +1756,11 @@ void MetalSourceEmitter::emitInterpolationModifiersImpl(
     IRVarLayout* layout)
 {
     SLANG_UNUSED(layout);
-    SLANG_UNUSED(valueType);
+
+    // MSL interpolation attributes are valid only on scalar and vector stage fields; a field of
+    // array type (the helper-side storage of a flattened interface) must not carry one.
+    if (as<IRArrayType>(valueType))
+        return;
 
     // MSL takes one interpolation attribute that combines the sampling (center, centroid,
     // sample) and the perspective correction: [[center_perspective]] (the default),

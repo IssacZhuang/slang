@@ -1,0 +1,97 @@
+name: ngs-binaries
+
+# Builds only the Slang runtime files NoGraphicsSharp ships under
+# src/NoGraphicsSharp.Slang/runtimes/<rid>/native, for every RID it supports:
+#   win-x64, win-arm64: slang.dll + slang-compiler.dll
+#   linux-x64, linux-arm64: libslang.so
+#   osx-x64, osx-arm64: libslang.dylib
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+
+jobs:
+  build:
+    name: ${{ matrix.rid }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { rid: win-x64, os: windows-latest, msvc-arch: amd64 }
+          - { rid: win-arm64, os: windows-latest, msvc-arch: amd64_arm64 }
+          - { rid: linux-x64, os: ubuntu-22.04 }
+          - { rid: linux-arm64, os: ubuntu-22.04-arm }
+          - { rid: osx-x64, os: macos-14, mac-arch: x86_64 }
+          - { rid: osx-arm64, os: macos-14 }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Host-arch tools first: generators must never cross-compile.
+      - name: Setup host MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      - name: Build generators
+        run: |
+          cmake --workflow --preset generators --fresh -DSLANG_ENABLE_PCH=OFF
+          cmake --install build --config Release --component generators --prefix build-platform-generators
+
+      - name: Setup target MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc-arch }}
+
+      - name: Setup macOS target architecture
+        if: runner.os == 'macOS' && matrix.mac-arch != ''
+        run: echo "CMAKE_OSX_ARCHITECTURES=${{ matrix.mac-arch }}" >> "$GITHUB_ENV"
+
+      - name: Configure and build
+        env:
+          # MSVC must read the UTF-8 sources as UTF-8 (a trailing em dash in a
+          # comment otherwise swallows the line break under the system codepage
+          # and shifts every __LINE__ after it) and use the standard-conforming
+          # preprocessor the FIDDLE line-macro mechanism assumes.
+          CL: /utf-8 /Zc:preprocessor
+        run: |
+          args=(
+            -DSLANG_GENERATORS_PATH="$PWD/build-platform-generators/bin"
+            -DSLANG_ENABLE_PCH=OFF
+            -DSLANG_SLANG_LLVM_FLAVOR=DISABLE
+            -DSLANG_DXC_BUILD_FROM_SOURCE=OFF
+            -DSLANG_ENABLE_EXAMPLES=OFF
+            -DSLANG_ENABLE_TESTS=OFF
+          )
+          if [[ "${{ matrix.rid }}" == win-arm64 ]]; then
+            args+=(-DSLANG_ENABLE_CUDA=0)
+          fi
+          case "${{ matrix.rid }}" in
+            win-*) targets=(slang-compiler.dll slang.dll) ;;
+            linux-*) targets=(libslang-compiler.so) ;;
+            osx-*) targets=(libslang-compiler.dylib) ;;
+          esac
+          cmake --preset default --fresh "${args[@]}"
+          cmake --build build --config Release --target "${targets[@]}"
+
+      - name: Collect
+        run: |
+          mkdir -p "dist/${{ matrix.rid }}"
+          case "${{ matrix.rid }}" in
+            win-*) cp build/Release/bin/slang.dll build/Release/bin/slang-compiler.dll "dist/${{ matrix.rid }}/" ;;
+            linux-*) cp -L build/Release/lib/libslang-compiler.so "dist/${{ matrix.rid }}/libslang.so" ;;
+            osx-*) cp -L build/Release/lib/libslang-compiler.dylib "dist/${{ matrix.rid }}/libslang.dylib" ;;
+          esac
+          ls -la "dist/${{ matrix.rid }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: slang-ngs-${{ matrix.rid }}
+          path: dist
