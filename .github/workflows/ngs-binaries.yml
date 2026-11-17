@@ -21,9 +21,11 @@ jobs:
           - { rid: win-arm64, os: windows-latest, msvc-arch: amd64_arm64 }
           - { rid: linux-x64, os: ubuntu-22.04 }
           - { rid: linux-arm64, os: ubuntu-22.04-arm }
-          - { rid: osx-x64, os: macos-latest, mac-arch: x86_64 }
-          - { rid: osx-arm64, os: macos-latest }
-    runs-on: ${{ matrix.os }}
+          - { rid: osx-x64, mac-arch: x86_64 }
+          - { rid: osx-arm64 }
+    # The GitHub-hosted macOS queue can stall for hours; osx jobs run on the
+    # self-hosted Mac mini registered for this fork instead.
+    runs-on: ${{ matrix.os || fromJSON('["self-hosted", "macOS"]') }}
     defaults:
       run:
         shell: bash
@@ -31,6 +33,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      # The Mac mini's cmake/ninja are pip installs living outside the runner's
+      # default PATH.
+      - name: Setup macOS tools
+        if: runner.os == 'macOS'
+        run: echo "$HOME/Library/Python/3.9/bin" >> "$GITHUB_PATH"
 
       # Host-arch tools first: generators must never cross-compile.
       - name: Setup host MSVC
